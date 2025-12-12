@@ -31,6 +31,7 @@ dependencies = [
     "google-cloud-speech (>=2.34.0,<3.0.0)",
     "langchain-groq (>=0.2.0)",
     "google-cloud-texttospeech (>=2.33.0,<3.0.0)",
+    "contextvars (>=2.4,<3.0)",
 ]
 
 

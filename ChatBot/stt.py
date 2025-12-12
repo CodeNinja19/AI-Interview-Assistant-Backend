@@ -2,33 +2,26 @@ import time
 import asyncio
 import json
 from google.cloud import speech
-from google.api_core.exceptions import OutOfRange, InvalidArgument
+from google.api_core.exceptions import OutOfRange, InvalidArgument, InternalServerError
 from ChatBot.events import VoiceAgentEvent 
 
 STREAM_LIMIT = 240 # 4 Minutes
 
 async def stt_stream(audio_queue: asyncio.Queue, websocket):
-    print("DEBUG: STT Stream Initialized (Magic Byte Filter)")
+    print("DEBUG: STT Stream Initialized (Stop-and-Wait Strategy)")
     
     while True:
         try:
-            # 1. Wait for Valid Audio
-            chunk = await audio_queue.get()
+            # 1. Wait for Audio (This will block until the frontend starts sending)
+            # On the first run, this grabs the header instantly.
+            # On rotation, this waits for the "start_audio" command to take effect.
+            initial_chunk = await audio_queue.get()
             
-            if chunk is None:
+            if initial_chunk is None:
                 print("DEBUG: End of Audio Stream.")
                 break 
-            
-            # --- CRITICAL FIX: Magic Byte Filter ---
-            # A valid WebM file MUST start with the EBML Header: 1A 45 DF A3
-            # If the chunk doesn't start with this, it's a "Tail" chunk from the old stream.
-            # We ignore it and wait for the real header.
-            if not chunk.startswith(b'\x1a\x45\xdf\xa3'):
-                # print(f"DEBUG: Ignoring non-header chunk ({len(chunk)} bytes)")
-                continue
-            # ---------------------------------------
 
-            # 2. Setup Client (Only if we found a valid header)
+            # 2. Setup Google Client
             client = speech.SpeechAsyncClient()
             config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
@@ -41,23 +34,44 @@ async def stt_stream(audio_queue: asyncio.Queue, websocket):
                 interim_results=True
             )
 
-            async def request_generator():
-                # Send Config
+            async def request_generator(header_chunk):
+                # Send Config & Header
                 yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-                
-                # Send the Header Chunk we verified
-                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+                yield speech.StreamingRecognizeRequest(audio_content=header_chunk)
                 
                 start_time = time.time()
                 
                 while True:
-                    # Time Limit Check
+                    # --- ROTATION LOGIC (STOP-AND-WAIT) ---
                     if time.time() - start_time > STREAM_LIMIT:
-                        print("DEBUG: ⏱️ Time Limit. Sending Rotation Command...")
-                        # Tell Frontend to Restart Mic (This generates a NEW Header)
-                        await websocket.send_text(json.dumps({"type": "rotate_audio"}))
-                        return 
+                        print("DEBUG: ⏱️ Time Limit. Orchestrating Restart...")
+                        
+                        # Step A: Tell Frontend to STOP sending audio
+                        await websocket.send_text(json.dumps({"type": "stop_audio"}))
+                        
+                        # Step B: Wait for the 'Stop' to take effect and pipe to dry up
+                        # We give it 1 second to ensure all in-flight packets arrive
+                        await asyncio.sleep(1.0) 
+                        
+                        # Step C: FLUSH QUEUE
+                        # We are now 100% sure the queue only contains old garbage
+                        dropped = 0
+                        while not audio_queue.empty():
+                            try:
+                                audio_queue.get_nowait()
+                                dropped += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        print(f"DEBUG: 🧹 Safe-Flushed {dropped} packets.")
+                        
+                        # Step D: Tell Frontend to START recording again
+                        # This generates the NEW Header, which will be the first thing
+                        # the main loop sees when we return.
+                        await websocket.send_text(json.dumps({"type": "start_audio"}))
+                        
+                        return # Restart main loop
 
+                    # --- STANDARD STREAMING ---
                     try:
                         data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
                         if data is None: raise StopAsyncIteration()
@@ -66,38 +80,37 @@ async def stt_stream(audio_queue: asyncio.Queue, websocket):
                     except asyncio.TimeoutError:
                         continue
 
-            # 3. Start Streaming
-            stream_responses = await client.streaming_recognize(requests=request_generator())
-            
-            async for response in stream_responses:
-                if not response.results: continue
-                result = response.results[0]
-                if not result.alternatives: continue
-                
-                transcript = result.alternatives[0].transcript
-                is_final = result.is_final
-                
-                if not transcript.strip(): continue
-                
-                # Yield Event
-                yield VoiceAgentEvent(
-                    type="stt_output",
-                    text=transcript,
-                    is_final=is_final,
-                    confidence=result.alternatives[0].confidence
-                )
+            # 3. Run Stream
+            try:
+                stream_responses = await client.streaming_recognize(requests=request_generator(initial_chunk))
+                async for response in stream_responses:
+                    if not response.results: continue
+                    result = response.results[0]
+                    if not result.alternatives: continue
+                    transcript = result.alternatives[0].transcript
+                    is_final = result.is_final
+                    if not transcript.strip(): continue
+                    
+                    yield VoiceAgentEvent(
+                        type="stt_output",
+                        text=transcript,
+                        is_final=is_final,
+                        confidence=result.alternatives[0].confidence
+                    )
+
+            except InternalServerError:
+                print("WARN: Google 500 Error. Restarting...")
+                continue
 
         except StopAsyncIteration:
             break
         except (OutOfRange, InvalidArgument) as e:
-            # If we get a 400 error, it means we are out of sync.
-            # Force a rotation to get a fresh header.
-            print(f"⚠️ Google Stream Error ({e}). Forcing Rotation...")
-            try:
-                await websocket.send_text(json.dumps({"type": "rotate_audio"}))
-            except:
-                pass
-            await asyncio.sleep(1)
+            # Fallback if something still goes wrong
+            print(f"⚠️ Stream Error ({e}). Forcing Restart...")
+            await websocket.send_text(json.dumps({"type": "stop_audio"}))
+            await asyncio.sleep(1.0)
+            while not audio_queue.empty(): audio_queue.get_nowait()
+            await websocket.send_text(json.dumps({"type": "start_audio"}))
             continue
         except Exception as e:
             print(f"🛑 STT Loop Error: {e}")

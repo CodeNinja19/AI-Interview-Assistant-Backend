@@ -2,7 +2,7 @@ import asyncio
 import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import AsyncIterator
-
+from ChatBot.socket_manager import active_websocket
 # Import your modules
 from ChatBot.stt import stt_stream
 from ChatBot.invoke_agent import agent_stream
@@ -13,6 +13,8 @@ router = APIRouter(prefix='/socket')
 
 @router.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
+    print("INFO: Setting the websocket")
+    active_websocket.set(websocket)
     await websocket.accept()
     print("INFO: WebSocket connection accepted")
 
@@ -30,26 +32,28 @@ async def websocket_endpoint(websocket: WebSocket):
     }
 
     # --- TASK A: Read from WebSocket (Audio + Config) ---
+    # --- TASK A: Read from WebSocket ---
+    # --- TASK A: Read from WebSocket ---
     async def receive_socket_data():
         try:
             while True:
-                # Catch RuntimeError here in case socket disconnects mid-read
                 message = await websocket.receive()
 
                 if "bytes" in message:
                     data = message["bytes"]
-                    # CRITICAL: Filter empty bytes to prevent Google 400 Errors
                     if data and len(data) > 0:
                         await audio_queue.put(data)
-                
+
                 elif "text" in message:
                     try:
-                        config = json.loads(message["text"])
-                        if config.get("type") == "config":
-                            new_mode = config.get("listen_only", False)
+                        data = json.loads(message["text"])
+                        
+                        # 1. ✅ RESTORED: Config / Mode Switching Logic
+                        if data.get("type") == "config":
+                            new_mode = data.get("listen_only", False)
                             
-                            # LOGIC: Switch FROM Listen TO Interactive
-                            # We need to tell the gate to release the held text
+                            # LOGIC: If switching FROM Listen (True) TO Interactive (False)
+                            # We must tell the gate to FLUSH the buffer now.
                             if state["listen_only"] and not new_mode:
                                 print("DEBUG: 🟢 Switching to Interactive. Flushing Buffer...")
                                 await event_queue.put(VoiceAgentEvent(
@@ -59,36 +63,49 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             state["listen_only"] = new_mode
                             print(f"INFO: Mode set to: {'Listen Only' if new_mode else 'Interactive'}")
+
+                        # 2. Handle Code Submission
+                        elif data.get("type") == "code_submission":
+                            user_code = data.get("code", "")
+                            print(f"DEBUG: 📥 Received Code Submission: {len(user_code)} chars")
                             
+                            # Send to queue (Logic Gate will decide to buffer or pass based on mode)
+                            await event_queue.put(VoiceAgentEvent(
+                                type="user_submission", 
+                                text=f"I have submitted the following code for review:\n```cpp\n{user_code}\n```",
+                                is_final=True
+                            ))
+
                     except Exception as e:
-                        print(f"Config Error: {e}")
+                        print(f"JSON Error: {e}")
 
         except WebSocketDisconnect:
-            print("INFO: Client disconnected (Standard)")
-            
-        except RuntimeError as e:
-            # Handle "Cannot call receive once a disconnect message has been received"
-            if "disconnect" in str(e).lower():
-                print("INFO: Client connection lost (Runtime)")
-            else:
-                print(f"Socket Error: {e}")
-                
+            print("INFO: Client disconnected")
+        except Exception as e:
+            print(f"Socket Error: {e}")
         finally:
-            # Signal all other tasks to stop
             await audio_queue.put(None)
             await event_queue.put(None)
+
 
     # --- TASK B: Google STT Producer ---
     async def run_stt_process():
         try:
             # Pass the Queue DIRECTLY to stt_stream. 
-            # Do NOT use a generator here, or you break the "Infinite/Lazy" logic.
             async for event in stt_stream(audio_queue, websocket): 
                 await event_queue.put(event)
+                
+        except asyncio.CancelledError:
+            # ✅ This handles the "End Stream" signal gracefully
+            print("INFO: STT Process cancelled (Standard Shutdown)")
+            
         except Exception as e:
+            # This handles actual crashes (like Google API errors)
             print(f"STT Process Error: {e}")
+            
+        finally:
+            # Always ensure the event queue knows we are done
             await event_queue.put(None)
-
     # --- TASK C: The Logic Gate (Middleware) ---
     async def buffer_gate_middleware():
         while True:
@@ -122,16 +139,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # --- LOGIC 3: Mode Handling ---
             if state["listen_only"]:
-                # LISTEN MODE: Store text, do NOT yield to Agent
-                if event.type == "stt_output" and event.is_final and event.text:
+                # ✅ CHANGED: Buffer if it is STT *OR* a Code Submission
+                is_content_event = (event.type == "stt_output" and event.is_final) or (event.type == "user_submission")
+
+                if is_content_event and event.text:
                     state["transcript_buffer"].append(event.text)
-                    print(f"🔒 Buffered: '{event.text}'")
+                    print(f"🔒 Buffered Content: {event.text[:30]}...")
+                
                 else:
-                    # Pass through non-speech events (logs, errors)
-                    if event.type != "stt_output":
+                    # Pass through system events (like errors or logs)
+                    if event.type != "stt_output" and event.type != "user_submission":
                         yield event
             else:
-                # INTERACTIVE MODE: Pass everything
+                # INTERACTIVE MODE: Pass everything to the Agent
                 yield event
 
     # --- TASK D: The Response Pipeline ---

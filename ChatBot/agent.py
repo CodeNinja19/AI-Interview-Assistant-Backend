@@ -7,6 +7,7 @@ from pymongo import MongoClient
 from ChatBot.tools.tool_list import tool_list
 from langgraph.prebuilt import ToolNode, tools_condition
 import os
+from typing import List
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -20,6 +21,7 @@ sys_msg = SystemMessage(content="""
                         - If the user says he does not now the answer to a question, move to next question. This question will also count towards the total question count. 
 
                         If a response is vague, probe deeper with a targeted follow-up; otherwise, acknowledge the answer briefly and move to the next technical topic. Keep your responses concise (under 2-3 sentences) to ensure a natural speaking pace.
+                        - Before giving an coding quetion requiring the text editor. First explain the question to the user then say you will open the text editor to allow them to implement. 
                         - When you give the user an question expect an answer back. If the user doesn't respond with an answer, prompt them again to answer the question. By saying please answer the question that i gave you.
                         - if the user answers think of the question you asked and make sure the user answered the question you asked. If they did not answer the question you asked, prompt them again to answer the question you asked by saying please answer the question that i gave you.
                         - Just ask one question at a time and wait for the user's response. Return an answer score after user asks to rate the performance.
@@ -36,10 +38,10 @@ def assistant(state:MessagesState):
     return {"messages":[llm.invoke([sys_msg] + state["messages"])]}
 
 
-def get_agent():
+def get_agent(extra_tools: List = []):
     graph = StateGraph(MessagesState)
     graph.add_node("assistant",assistant)
-    graph.add_node("tools",ToolNode(tool_list))
+    graph.add_node("tools",ToolNode(tool_list + extra_tools))
     graph.add_edge(START,"assistant")
     graph.add_conditional_edges("assistant",tools_condition)
     graph.add_edge("tools","assistant")
